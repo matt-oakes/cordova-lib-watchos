@@ -17,18 +17,14 @@
     under the License.
 */
 
-/* jshint unused:false, expr:true */
+/* jshint expr:true */
 
-var platform_modules   = require('../platforms/platforms'),
-    path               = require('path'),
+var path               = require('path'),
     aliasify           = require('aliasify'),
-    config_changes     = require('./util/config-changes'),
     common             = require('./platforms/common'),
     fs                 = require('fs'),
     childProcess       = require('child_process'),
-    shell              = require('shelljs'),
-    util               = require('util'),
-    events             = require('../events'),
+    events             = require('cordova-common').events,
     plugman            = require('./plugman'),
     bundle             = require('cordova-js/tasks/lib/bundle-browserify'),
     writeLicenseHeader = require('cordova-js/tasks/lib/write-license-header'),
@@ -36,33 +32,13 @@ var platform_modules   = require('../platforms/platforms'),
     computeCommitId    = require('cordova-js/tasks/lib/compute-commit-id'),
     Readable           = require('stream').Readable;
 
-var PlatformJson = require('./util/PlatformJson');
-var PluginInfoProvider = require('../PluginInfoProvider');
-
-function uninstallQueuedPlugins(platformJson, wwwDir) {
-    // Check if there are any plugins queued for uninstallation, and if so, remove any of their plugin web assets loaded in
-    // via <js-module> elements
-    var plugins_to_uninstall = platformJson.root.prepare_queue.uninstalled;
-    if (plugins_to_uninstall && plugins_to_uninstall.length) {
-        var plugins_www = path.join(wwwDir, 'plugins');
-        if (fs.existsSync(plugins_www)) {
-            plugins_to_uninstall.forEach(function(plug) {
-                var id = plug.id;
-                var plugin_modules = path.join(plugins_www, id);
-                if (fs.existsSync(plugin_modules)) {
-                    events.emit('verbose', 'Removing plugins directory from www "'+plugin_modules+'"');
-                    shell.rm('-rf', plugin_modules);
-                }
-            });
-        }
-    }
-}
+var PlatformJson = require('cordova-common').PlatformJson;
+var PluginInfoProvider = require('cordova-common').PluginInfoProvider;
 
 function generateFinalBundle(platform, libraryRelease, outReleaseFile, commitId, platformVersion) {
     var deferred = Q.defer();
     var outReleaseFileStream = fs.createWriteStream(outReleaseFile);
     var time = new Date().valueOf();
-    var symbolList = null;
 
     writeLicenseHeader(outReleaseFileStream, platform, commitId, platformVersion);
 
@@ -78,7 +54,6 @@ function generateFinalBundle(platform, libraryRelease, outReleaseFile, commitId,
     });
 
     outReleaseFileStream.on('error', function(err) {
-        var newtime = new Date().valueOf() - time;
         events.emit('log', 'error while generating cordova.js');
         deferred.reject();
     });
@@ -109,11 +84,7 @@ function getPlatformVersion(cId, project_dir) {
     return deferred.promise;
 }
 
-// Called on --prepare.
-// Sets up each plugin's Javascript code to be loaded properly.
-// Expects a path to the project (platforms/android in CLI, . in plugman-only),
-// a path to where the plugins are downloaded, the www dir, and the platform ('android', 'ios', etc.).
-module.exports = function handlePrepare(project_dir, platform, plugins_dir, www_dir, is_top_level, pluginInfoProvider) {
+module.exports = function doBrowserify (project, platformApi, pluginInfoProvider) {
     // Process:
     // - Do config munging by calling into config-changes module
     // - List all plugins in plugins_dir
@@ -123,25 +94,17 @@ module.exports = function handlePrepare(project_dir, platform, plugins_dir, www_
     // - For each js-module (general first, then platform) build up an object storing the path and any clobbers, merges and runs for it.
     // Write this object into www/cordova_plugins.json.
     // This file is not really used. Maybe cordova app harness
+    var platform = platformApi.platform;
     events.emit('verbose', 'Preparing ' + platform + ' browserify project');
     pluginInfoProvider = pluginInfoProvider || new PluginInfoProvider(); // Allow null for backwards-compat.
-    var platformJson = PlatformJson.load(plugins_dir, platform);
-    var wwwDir = www_dir || platform_modules.getPlatformProject(platform, project_dir).www_dir();
-
-    uninstallQueuedPlugins(platformJson, www_dir);
-
-    events.emit('verbose', 'Processing configuration changes for plugins.');
-    config_changes.process(plugins_dir, project_dir, platform, platformJson, pluginInfoProvider);
-
-    if(!is_top_level) {
-        return Q();
-    }
+    var platformJson = PlatformJson.load(project.locations.plugins, platform);
+    var wwwDir = platformApi.getPlatformInfo().locations.www;
 
     var commitId;
     return computeCommitIdSync()
     .then(function(cId){
         commitId = cId;
-        return getPlatformVersion(commitId, project_dir);
+        return getPlatformVersion(commitId, platformApi.root);
     }).then(function(platformVersion){
         var libraryRelease = bundle(platform, false, commitId, platformVersion);
 
@@ -150,8 +113,8 @@ module.exports = function handlePrepare(project_dir, platform, plugins_dir, www_
 
         var plugins = Object.keys(platformJson.root.installed_plugins).concat(Object.keys(platformJson.root.dependent_plugins));
         events.emit('verbose', 'Iterating over installed plugins:', plugins);
-        plugins && plugins.forEach(function(plugin) {
-            var pluginDir = path.join(plugins_dir, plugin);
+        plugins.forEach(function (plugin) {
+            var pluginDir = path.join(project.locations.plugins, plugin);
             var pluginInfo = pluginInfoProvider.get(pluginDir);
             // pluginMetadata is a mapping from plugin IDs to versions.
             pluginMetadata[pluginInfo.id] = pluginInfo.version;
@@ -166,7 +129,12 @@ module.exports = function handlePrepare(project_dir, platform, plugins_dir, www_
             .forEach(function(jsModule) {
                 var moduleName = jsModule.name ? jsModule.name : path.basename(jsModule.src, '.js');
                 var moduleId = pluginInfo.id + '.' + moduleName;
-                var moduleMetadata = {file: jsModule.src, id: moduleId, name: moduleName};
+                var moduleMetadata = {
+                    file: jsModule.src,
+                    id: moduleId,
+                    name: moduleName,
+                    pluginId: pluginInfo.id
+                };
 
                 if (jsModule.clobbers.length > 0) {
                     moduleMetadata.clobbers = jsModule.clobbers.map(function(o) { return o.target; });
